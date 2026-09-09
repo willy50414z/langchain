@@ -1,19 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from pydantic import BaseModel, Field
-
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-except ImportError:
-    ChatGoogleGenerativeAI = None
 
 
 class StudyPlan(BaseModel):
@@ -36,34 +33,27 @@ class LangChainService:
     ) -> None:
         load_dotenv()
         self._config = self._load_config(config_path)
-        self.api_key = (
-            api_key
-            or self._read_provider_config("api_key")
-            or os.getenv("GOOGLE_API_KEY")
-            or os.getenv("GEMINI_API_KEY")
-        )
         self.base_url = (
             base_url
             or self._read_provider_config("base_url")
-            or os.getenv("GOOGLE_API_BASE")
-            or os.getenv("GEMINI_BASE_URL")
+            or os.getenv("LOCAL_MODEL_BASE_URL")
+            or "http://193.168.1.127:7301/api/generate"
         )
         self.chat_model_name = (
             chat_model_name
             or self._read_provider_config("chat_model")
-            or os.getenv("GEMINI_CHAT_MODEL")
-            or os.getenv("GOOGLE_CHAT_MODEL")
-            or os.getenv("GOOGLE_MODEL")
-            or "gemini-2.5-flash"
+            or os.getenv("LOCAL_CHAT_MODEL")
+            or os.getenv("LOCAL_MODEL_NAME")
+            or "gemma4"
         )
         self.llm_model_name = (
             llm_model_name
             or self._read_provider_config("llm_model")
-            or os.getenv("GEMINI_LLM_MODEL")
-            or os.getenv("GOOGLE_LLM_MODEL")
+            or os.getenv("LOCAL_LLM_MODEL")
             or self.chat_model_name
         )
         self.temperature = self._resolve_temperature(temperature)
+        self.request_timeout = self._resolve_request_timeout()
 
     @staticmethod
     def _default_config_candidates() -> list[Path]:
@@ -94,7 +84,7 @@ class LangChainService:
         return None
 
     def _read_provider_config(self, key: str) -> str | None:
-        return self._read_config("gemini", key)
+        return self._read_config("local_model", key) or self._read_config("gemini", key)
 
     def _resolve_temperature(self, temperature: float | None) -> float:
         if temperature is not None:
@@ -102,8 +92,8 @@ class LangChainService:
 
         value = (
             self._read_provider_config("temperature")
+            or os.getenv("LOCAL_MODEL_TEMPERATURE")
             or os.getenv("GEMINI_TEMPERATURE")
-            or os.getenv("GOOGLE_TEMPERATURE")
         )
         if not value:
             return 0.2
@@ -111,25 +101,62 @@ class LangChainService:
         try:
             return float(value)
         except ValueError as exc:
-            raise ValueError("Invalid gemini.temperature value in application.ini. Use a number like 0.2.") from exc
+            raise ValueError("Invalid local_model.temperature value in application.ini. Use a number like 0.2.") from exc
 
-    def _validate_api_key(self) -> None:
-        if not self.api_key:
-            raise EnvironmentError(
-                "GOOGLE_API_KEY is required. Set [gemini] api_key in application.ini or GOOGLE_API_KEY/GEMINI_API_KEY in environment."
-            )
-
-    def _chat_model(self, model_name: str | None = None) -> Any:
-        if ChatGoogleGenerativeAI is None:
-            raise ImportError(
-                "langchain-google-genai is required for Gemini. Install it with `pip install langchain-google-genai`."
-            )
-
-        return ChatGoogleGenerativeAI(
-            model=model_name or self.chat_model_name,
-            temperature=self.temperature,
-            google_api_key=self.api_key,
+    def _resolve_request_timeout(self) -> float:
+        value = (
+            self._read_provider_config("request_timeout")
+            or os.getenv("LOCAL_MODEL_TIMEOUT")
+            or "180"
         )
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid local_model.request_timeout value in application.ini. Use seconds like 180."
+            ) from exc
+
+    def _generate(self, prompt: str, model_name: str | None = None) -> str:
+        payload = json.dumps(
+            {
+                "model": model_name or self.chat_model_name,
+                "prompt": prompt,
+                "stream": False,
+            }
+        ).encode("utf-8")
+        req = request.Request(
+            self.base_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(req, timeout=self.request_timeout) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Local model API returned HTTP {exc.code}: {detail}"
+            ) from exc
+        except error.URLError as exc:
+            raise EnvironmentError(
+                f"Cannot connect to local model API at {self.base_url}: {exc.reason}"
+            ) from exc
+
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Local model API did not return valid JSON: {body}") from exc
+
+        text = result.get("response")
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError(f"Local model API response missing 'response' text: {result}")
+        return text.strip()
 
     @staticmethod
     def _to_text(result: Any) -> str:
@@ -139,36 +166,33 @@ class LangChainService:
 
     def demo_prompt_template(self, topic: str, weeks: int = 2) -> str:
         """Prompts: 建立可參數化的 Prompt Template 並呼叫 Chat Model。"""
-        self._validate_api_key()
-
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", "你是 LangChain 學習教練，回答要精簡、可執行。"),
                 ("human", "請幫我規劃 {weeks} 週的 {topic} 入門重點，使用 3 點條列。"),
             ]
         )
-        chain = prompt | self._chat_model()
-        result = chain.invoke({"topic": topic, "weeks": weeks})
-        return result.content
+        messages = prompt.format_messages(topic=topic, weeks=weeks)
+        rendered_prompt = "\n".join(f"{message.type}: {message.content}" for message in messages)
+        return self._generate(rendered_prompt)
 
     def demo_chat_model_vs_llm(self, question: str) -> dict[str, str]:
         """Chat Models & LLMs: 以 Gemini Chat API 展示 chat 與 llm-style prompt 差異。"""
-        self._validate_api_key()
-
         chat_prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", "你是技術助理，回答限制在 80 字內。"),
                 ("human", "{question}"),
             ]
         )
-        chat_chain = chat_prompt | self._chat_model()
-        chat_response = self._to_text(chat_chain.invoke({"question": question}))
+        chat_messages = chat_prompt.format_messages(question=question)
+        chat_rendered_prompt = "\n".join(f"{message.type}: {message.content}" for message in chat_messages)
+        chat_response = self._generate(chat_rendered_prompt)
 
         llm_prompt = PromptTemplate.from_template(
             "你是技術助理，請用 80 字內回答。\n問題: {question}\n回答:"
         )
-        llm_chain = llm_prompt | self._chat_model(model_name=self.llm_model_name)
-        llm_response = self._to_text(llm_chain.invoke({"question": question}))
+        llm_rendered_prompt = llm_prompt.format(question=question)
+        llm_response = self._generate(llm_rendered_prompt, model_name=self.llm_model_name)
 
         return {
             "chat_model": chat_response,
@@ -177,8 +201,6 @@ class LangChainService:
 
     def demo_json_output_parser(self, topic: str) -> dict[str, Any]:
         """Output Parsers: 使用 JsonOutputParser 回傳結構化 JSON。"""
-        self._validate_api_key()
-
         parser = JsonOutputParser()
         prompt = PromptTemplate(
             template=(
@@ -191,13 +213,12 @@ class LangChainService:
             partial_variables={"format_instructions": parser.get_format_instructions()},
         )
 
-        chain = prompt | self._chat_model() | parser
-        return chain.invoke({"topic": topic})
+        rendered_prompt = prompt.format(topic=topic)
+        raw_text = self._generate(rendered_prompt)
+        return parser.invoke(raw_text)
 
     def demo_pydantic_output_parser(self, topic: str) -> StudyPlan:
         """Output Parsers: 使用 PydanticOutputParser 輸出強型別物件。"""
-        self._validate_api_key()
-
         parser = PydanticOutputParser(pydantic_object=StudyPlan)
         prompt = PromptTemplate(
             template=(
@@ -210,5 +231,6 @@ class LangChainService:
             partial_variables={"format_instructions": parser.get_format_instructions()},
         )
 
-        chain = prompt | self._chat_model() | parser
-        return chain.invoke({"topic": topic})
+        rendered_prompt = prompt.format(topic=topic)
+        raw_text = self._generate(rendered_prompt)
+        return parser.invoke(raw_text)

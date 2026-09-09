@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "phase3_wf": "langgraph.phase3_wf:graph"
+  },
+  "env": ".env"
+}
